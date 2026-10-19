@@ -6,3 +6,7 @@
 __pycache__/
 *.pyc
 .venv/
+
+# transients
+.tmp/
+.news_seen.json

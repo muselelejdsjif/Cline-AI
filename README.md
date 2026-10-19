@@ -35,6 +35,10 @@ python3 tools/telegram.py updates --limit 20
 # 发文本(Markdown / MarkdownV2 / HTML)
 python3 tools/telegram.py send --chat-id <chat_id> --text '部署完成 ✅'
 
+# 内容较长或含引号时,从文件读取正文(推荐)
+python3 tools/telegram.py send --chat-id <chat_id> \
+    --parse-mode HTML --text-file /tmp/digest.html
+
 # 发文件(日志、报告、截图)
 python3 tools/telegram.py send-file --chat-id <chat_id> \
     --file build/report.txt --caption 'nightly build'

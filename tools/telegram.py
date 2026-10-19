@@ -213,12 +213,18 @@ def command_chats(args: argparse.Namespace) -> int:
 
 def command_send(args: argparse.Namespace) -> int:
     token = resolve_token(args)
+    text = args.text
+    if args.text_file:
+        with open(args.text_file, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    if not text:
+        raise TelegramError("Message text is empty (use --text or --text-file)")
     result = call(
         token,
         "sendMessage",
         {
             "chat_id": args.chat_id,
-            "text": args.text,
+            "text": text,
             "parse_mode": args.parse_mode,
             "disable_web_page_preview": "true" if args.no_preview else None,
             "disable_notification": "true" if args.silent else None,
@@ -300,7 +306,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     send = subparsers.add_parser("send", help="Send a text message")
     send.add_argument("--chat-id", required=True)
-    send.add_argument("--text", required=True)
+    send.add_argument("--text")
+    send.add_argument(
+        "--text-file", help="Read message body from a UTF-8 file instead of --text"
+    )
     send.add_argument(
         "--parse-mode", choices=["Markdown", "MarkdownV2", "HTML"], default=None
     )
