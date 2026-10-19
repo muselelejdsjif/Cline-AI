@@ -11,3 +11,4 @@ __pycache__/
 .tmp/
 .news_seen.json
 bin/
+conf/
