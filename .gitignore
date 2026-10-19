@@ -1,0 +1,8 @@
+# Telegram bot token (never commit)
+.telegram_token
+.telegram_state.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
