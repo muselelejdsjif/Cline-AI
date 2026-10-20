@@ -129,7 +129,7 @@ CATEGORY_KEYWORDS: Dict[str, List[str]] = {
     "外贸": [
         "关税", "贸易", "出口", "进口", "海关", "外贸", "航运", "运价", "港口",
         "集装箱", "跨境电商", "供应链", "反倾销", "制裁清单", "东南亚", "出海",
-        "SCFI", "货运", "班轮", "保税",
+        "SCFI", "货运", "班轮", "保税", "自贸",
     ],
     "经济": [
         "央行", "利率", "降息", "加息", "LPR", "CPI", "PPI", "PMI", "GDP",
@@ -178,15 +178,21 @@ NEGATIVE = {
     "怎么看": -5, "如何看": -5, "怎么走": -4, "何去何从": -4,
     # 特稿/软文式开头,信息密度低
     "文 |": -4, "作者": -3, "编辑": -2, "本文": -4, "叙事": -5, "赛道": -3,
+    # 全角竖线的署名/配图注,是人物特稿而非事件
+    "文｜": -6, "编辑｜": -5, "作者｜": -5, "图源": -4,
     "故事": -4, "报告": -4, "图解": -5, "白皮书": -4, "榜单": -5,
     "排行": -5, "走低": -3, "跌超": -3, "涨超": -3, "月访问量": -3,
     "合作探索": -4, "非约束性": -3, "谅解备忘录": -3, "战略签约": -4,
     # 展会/招商/启动会一类活动稿,不是可推送的实质进展
     "展会": -6, "盛会": -6, "启幕": -5, "揭牌": -5, "启动仪式": -6,
     "推介会": -6, "对接会": -5, "战略合作": -4, "座谈": -4, "招商": -4,
+    # 工商注册/注册资本类快讯没有行业影响,不算热点
+    "注册资本": -8, "天眼查": -8, "企查查": -8, "经营范围": -6, "全资持股": -6,
+    # 厂商获奖/评级软文
+    "五星": -8, "获评": -6, "获奖": -6, "荣获": -6, "榜单": -5,
     "加速器": -3, "训练营": -5, "大赛": -4, "评选": -4,
     # 论坛/发布会只宣布意向,缺少可验证的落地动作
-    "论坛": -4, "开幕式": -4, "发布会": -2,
+    "论坛": -4, "开幕式": -4, "发布会": -2, "圆桌": -6, "年会": -5, "致辞": -6,
     # 数据前瞻/预告稿:写的是将要发生的事,不是已落地的结果
     "揭晓": -4, "市场参考": -5, "本周晚些": -4, "或打乱": -3,
 }
@@ -548,6 +554,11 @@ OUTLET_TAIL = re.compile(
     re.I,
 )
 LEAD_MARKER = re.compile(r"^(?:解读|分析|观察|深度|焦点|专访|评论)\s*[｜|:：\-]\s*")
+# 快讯页抓下来的正文常带一排「夜间 评论 收藏 分享:」导航按钮,先剥掉。
+NAV_PREFIX = re.compile(
+    r"^(?:(?:夜间|早间|午间|盘中|实时|快讯|要闻|热点|推荐)\s*)?"
+    r"(?:(?:评论|收藏|分享|打印|字号|点赞|举报|返回|更多)\s*[：:]?\s*){2,}[：:]?\s*"
+)
 # 导航栏/版权声明一类的抓取残留,不能当摘要用。
 BOILERPLATE = ("广告服务", "联系我们", "隐私政策", "使用条款", "版权所有", "扫码关注")
 
@@ -560,9 +571,28 @@ def is_boilerplate(summary: str) -> bool:
     return summary.count("×") >= 2
 
 
+def _strip_title_prefix(summary: str, nt: str, title: str) -> str:
+    """按字符对齐剥掉标题前缀,容忍标题后多挂的栏目名或标点差异。"""
+    matched = 0
+    cut = 0
+    for idx, ch in enumerate(summary):
+        low = ch.lower()
+        if not re.match(r"[0-9a-z\u4e00-\u9fff]", low):
+            continue
+        if matched < len(nt) and low == nt[matched]:
+            matched += 1
+            cut = idx + 1
+        else:
+            break
+    if matched >= int(len(nt) * 0.8):
+        return summary[cut:]
+    return summary[len(title):]
+
+
 def clean_summary(summary: str, title: str) -> str:
     """Drop outlet suffixes and lead markers; blank out title-echo summaries."""
     summary = LEAD_MARKER.sub("", re.sub(r"\s+", " ", summary or "").strip())
+    summary = NAV_PREFIX.sub("", summary)
     if is_boilerplate(summary):
         return ""
     # 去掉快讯的「【标题】」外壳,避免按标题长度切前缀时残留一个「】」
@@ -577,7 +607,9 @@ def clean_summary(summary: str, title: str) -> str:
         return ""
     if ns.startswith(nt):
         # The title is a truncated prefix of the full text: keep the remainder.
-        rest = summary[len(title):].lstrip("】」）) ").strip(" ，,、；;:-_")
+        rest = _strip_title_prefix(summary, nt, title)
+        rest = re.sub(r"^[\s\-—_|:：]*(?:市场参考|快讯|独家|原创|热点)?[\s\-—_|:：]*", "", rest)
+        rest = rest.lstrip("】」）) :：，,、").strip(" ，,、；;:-_")
         return rest if len(rest) >= 12 else ""
     return summary
 
@@ -629,6 +661,11 @@ DATA_SUBJECTS = (
     "工业增加值", "社会消费品零售",
 )
 COUNTRIES = ("中国", "美国", "欧元区", "日本", "德国", "英国", "韩国", "印度", "越南", "巴西")
+# 同一笔融资/订单在不同媒体上的标题差异较大,用「公司 + 数字」做事件指纹。
+EVENT_ENTITIES = (
+    "openai", "anthropic", "英伟达", "台积电", "特斯拉", "苹果", "华为",
+    "三星", "亚马逊", "微软", "meta", "谷歌", "deepmind", "字节跳动",
+)
 
 
 def _months(text: str) -> set:
@@ -677,6 +714,10 @@ def same_event(a: str, b: str) -> bool:
         prefix += 1
     if prefix >= 8 and _numbers(a) & _numbers(b):
         return True
+    # 同一家公司的同一笔交易常被改写成不同标题(「加速推进300亿美元融资」vs「加速融资…」),
+    # 公司名 + 关键数字相同即按同一事件处理。
+    if any(name in a and name in b for name in EVENT_ENTITIES) and _numbers(a) & _numbers(b):
+        return True
     # 长短两版转载(一方补了背景/引述)用二元组包含率兜底。
     if min(len(a), len(b)) >= 14:
         bigrams_a = {a[i:i + 2] for i in range(len(a) - 1)}
@@ -694,6 +735,8 @@ def clean_title(title: str) -> str:
     if bracket:
         title = bracket.group(1).strip()
     title = re.sub(r"^(?:解读|分析|观察|深度|焦点)[｜|:：\-]\s*", "", title)
+    # 金十等快讯会在标题尾部挂栏目名,如「…皆有可能-市场参考」
+    title = re.sub(r"\s*[-—_|·]\s*(?:市场参考|快讯|独家|原创|热点)\s*$", "", title)
     for sep in ("|", "丨", "｜", "_"):
         if sep in title:
             head = title.split(sep)[0].strip()
@@ -728,18 +771,43 @@ def shorten(text: str, limit: int = 190) -> str:
     return out
 
 
+ASCII_TOKEN = re.compile(r"[A-Za-z0-9]{1,6}")
+
+
+def kw_hit(keyword: str, text: str) -> bool:
+    """ASCII 短词按词边界匹配,避免 "AI" 命中 "Gains"、"CPI" 命中 "SCPIxx"。"""
+    if keyword == "AI":
+        # OpenAI / Anthropic 一类复合词里的 AI 也要算命中
+        return re.search(r"\bAI\b|OpenAI|Anthropic", text, re.I) is not None
+    if ASCII_TOKEN.fullmatch(keyword):
+        return re.search(rf"\b{re.escape(keyword)}\b", text, re.I) is not None
+    return keyword in text
+
+
 def classify(item: Dict[str, Any], hint: Optional[str]) -> Optional[str]:
     text = f"{item['title']} {item.get('summary', '')[:300]}"
     scores = {
-        tag: sum(1 for kw in words if kw.lower() in text.lower())
+        tag: sum(1 for kw in words if kw_hit(kw, text))
         for tag, words in CATEGORY_KEYWORDS.items()
     }
     best = max(scores, key=lambda tag: scores[tag])
-    if scores[best] >= 2:
+    title = item["title"]
+    title_hits = {
+        tag: sum(1 for kw in words if kw_hit(kw, title))
+        for tag, words in CATEGORY_KEYWORDS.items()
+    }
+    # 标题才是这条新闻的主语;只靠正文里顺带提到的关键词会被发布会通稿带偏。
+    if title_hits[best] >= 1:
         return best
-    if hint and scores.get(hint, 0) >= 1:
-        return hint
+    titled = [tag for tag, hits in title_hits.items() if hits >= 1]
+    if titled:
+        return max(titled, key=lambda tag: (title_hits[tag], scores[tag]))
+    # 标题完全没有类别关键词时,多半是通稿/发布会综述,正文偶尔提到一次不足以归入某一类。
     return None
+
+
+STATEMENT = re.compile(r"(表示|认为|呼吁|建议|指出|称，)")
+ACTION = re.compile(r"(宣布|签署|批准|发布|启动|加征|下调|上调|实施|通过|达成|生效|暂停|禁止|辞职|当选)")
 
 
 def score_item(item: Dict[str, Any], now: datetime) -> float:
@@ -753,6 +821,9 @@ def score_item(item: Dict[str, Any], now: datetime) -> float:
             value += weight
     if NUMBER_RE.search(text):
         value += 2
+    # 只有表态、没有任何落地动作的稿子(论坛发言、官员评论)降权
+    if STATEMENT.search(text) and not ACTION.search(text):
+        value -= 4
     # 疑问式标题多为前瞻/评论,不是已发生的事实
     if item["title"].rstrip().endswith(("？", "?")):
         value -= 5
@@ -794,6 +865,24 @@ def is_roundup(title: str) -> bool:
     return bool(ROUNDUP.search(title))
 
 
+def event_keys(item: Dict[str, Any]) -> set:
+    """「公司 + 金额/数量」指纹,用于跨媒体识别同一事件。"""
+    text = f"{item.get('title', '')} {item.get('summary', '')[:300]}".lower()
+    entities = [name for name in EVENT_ENTITIES if name.lower() in text]
+    if not entities:
+        return set()
+    numbers = set()
+    for match in re.finditer(r"\d+(?:\.\d+)?", text):
+        if match.group(0) in {"2024", "2025", "2026", "2027"}:
+            continue
+        if re.match(r"[月日年时分秒%]", text[match.end():match.end() + 1] or ""):
+            continue
+        value = match.group(0).split(".")[0]
+        if len(value) >= 2:
+            numbers.add(value)
+    return {f"{name}:{num}" for name in entities for num in numbers}
+
+
 def candidates(
     items: List[Dict[str, Any]],
     state: Dict[str, Any],
@@ -803,6 +892,7 @@ def candidates(
     seen_urls = {canonical_url(u) for u in state.get("urls", [])}
     seen_titles = set(state.get("titles", []))
     seen_norms = [normalize(t) for t in state.get("titles", []) if t]
+    seen_events = set(state.get("events", []))
     cutoff = now - timedelta(minutes=max_age)
     buckets: Dict[str, List[Dict[str, Any]]] = {tag: [] for tag, _ in CATEGORIES}
 
@@ -821,6 +911,9 @@ def candidates(
             continue
         norm_title = normalize(title)
         if any(same_event(norm_title, prev) for prev in seen_norms):
+            continue
+        if seen_events and event_keys(item) & seen_events:
+            log(f"skip seen event [{title[:30]}]")
             continue
         tag = classify(item, item.get("hint"))
         if not tag:
@@ -1011,6 +1104,10 @@ def collect_all(max_age: int) -> List[Dict[str, Any]]:
 def _record_push(state: Dict[str, Any], items: List[Dict[str, Any]]) -> None:
     state["urls"].extend(item["link"] for item in items)
     state["titles"].extend(normalize(item["title"]) for item in items)
+    state.setdefault("events", []).extend(
+        key for item in items for key in sorted(event_keys(item))
+    )
+    state["events"] = state["events"][-200:]
     state["empty_runs"] = 0
     state["last_push"] = datetime.now(timezone.utc).isoformat()
     state.pop("last_error", None)
