@@ -41,6 +41,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 BEIJING = timezone(timedelta(hours=8))
 MAX_MESSAGE_CHARS = 3500
 STATE_HISTORY = 200
+# 低于该分数的条目视为无实质进展(展会稿、纯解读、行情快照等),整类跳过而不硬凑。
+MIN_SCORE = 4
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -176,6 +178,14 @@ NEGATIVE = {
     "故事": -4, "报告": -4, "图解": -5, "白皮书": -4, "榜单": -5,
     "排行": -5, "走低": -3, "跌超": -3, "涨超": -3, "月访问量": -3,
     "合作探索": -4, "非约束性": -3, "谅解备忘录": -3, "战略签约": -4,
+    # 展会/招商/启动会一类活动稿,不是可推送的实质进展
+    "展会": -6, "盛会": -6, "启幕": -5, "揭牌": -5, "启动仪式": -6,
+    "推介会": -6, "对接会": -5, "战略合作": -4, "座谈": -4, "招商": -4,
+    "加速器": -3, "训练营": -5, "大赛": -4, "评选": -4,
+    # 论坛/发布会只宣布意向,缺少可验证的落地动作
+    "论坛": -4, "开幕式": -4, "发布会": -2,
+    # 数据前瞻/预告稿:写的是将要发生的事,不是已落地的结果
+    "揭晓": -4, "市场参考": -5, "本周晚些": -4, "或打乱": -3,
 }
 
 # 信源质量:主流通讯社/官方/专业媒体加分,内容农场与自媒体降权。
@@ -461,6 +471,35 @@ def resolve_google_news(url: str) -> str:
     return url
 
 
+def _body_text(page: str, limit: int = 240) -> str:
+    """First meaningful paragraphs of an article page, as a fallback summary."""
+    page = re.sub(r"<(script|style)\b.*?</\1>", " ", page, flags=re.S | re.I)
+    parts: List[str] = []
+    total = 0
+    for raw in re.findall(r"<p[^>]*>(.*?)</p>", page, re.S | re.I):
+        text = re.sub(r"\s+", " ", strip_tags(raw)).strip()
+        if len(text) < 25:
+            continue
+        if any(bad in text for bad in NOISE_PARAGRAPH):
+            continue
+        # 过滤脚本残留/图片地址一类非正文段落
+        if re.search(r"[{}<>]|https?://|\.jpg|\.png|var\s|function\s|=\s*\[", text):
+            continue
+        if len(re.findall(r"[\u4e00-\u9fff]", text)) < 15:
+            continue
+        parts.append(text)
+        total += len(text)
+        if total >= limit:
+            break
+    return " ".join(parts)[:limit]
+
+
+NOISE_PARAGRAPH = (
+    "责任编辑", "免责声明", "版权", "扫码", "关注我们", "原标题", "点击查看",
+    "未经授权", "更多精彩", "下载", "客户端",
+)
+
+
 def enrich(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Resolve the publisher URL and pull a usable summary from the page."""
     link = item["link"]
@@ -474,12 +513,22 @@ def enrich(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     summary = re.sub(r"\s+", " ", item.get("summary") or "").strip()
     summary = clean_summary(summary, item["title"])
 
-    if len(summary) < 30 and link.startswith("http"):
+    # 摘要太短或被源站用 "..." 截断时,回源抓 meta description,必要时再取正文首段
+    truncated = len(summary) < 120 and ("..." in summary or "…" in summary)
+    if (len(summary) < 30 or truncated) and link.startswith("http"):
+        page = ""
         try:
             page = decode_page(http_get(link, timeout=12))
-            summary = _meta_description(page) or summary
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             log(f"summary fetch failed {link}: {exc}")
+        if page:
+            meta = _meta_description(page)
+            if meta and len(meta) > len(summary):
+                summary = meta
+            if len(summary) < 90 or "..." in summary:
+                body = _body_text(page)
+                if len(body) > len(summary):
+                    summary = body
 
     summary = clean_summary(summary, item["title"])
     item["summary"] = summary
@@ -500,6 +549,8 @@ LEAD_MARKER = re.compile(r"^(?:解读|分析|观察|深度|焦点|专访|评论)
 def clean_summary(summary: str, title: str) -> str:
     """Drop outlet suffixes and lead markers; blank out title-echo summaries."""
     summary = LEAD_MARKER.sub("", re.sub(r"\s+", " ", summary or "").strip())
+    # 去掉快讯的「【标题】」外壳,避免按标题长度切前缀时残留一个「】」
+    summary = re.sub(r"^【([^】]{8,80})】\s*", r"\1 ", summary)
     summary = OUTLET_TAIL.sub("", summary).strip(" ，,、；;|-_")
     if not summary:
         return ""
@@ -510,7 +561,7 @@ def clean_summary(summary: str, title: str) -> str:
         return ""
     if ns.startswith(nt):
         # The title is a truncated prefix of the full text: keep the remainder.
-        rest = summary[len(title):].strip(" ，,、；;:-_")
+        rest = summary[len(title):].lstrip("】」）) ").strip(" ，,、；;:-_")
         return rest if len(rest) >= 12 else ""
     return summary
 
@@ -518,8 +569,29 @@ def normalize(title: str) -> str:
     return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", title).lower()
 
 
+def same_event(a: str, b: str) -> bool:
+    """同一事件的不同转载:标题高度重合(仅站点后缀/个别措辞不同)。"""
+    if not a or not b:
+        return False
+    if len(a) >= 16 and len(b) >= 16 and (a[:20] in b or b[:20] in a):
+        return True
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) >= 12 and short in long_:
+        return True
+    grams_a = {a[i:i + 3] for i in range(len(a) - 2)}
+    grams_b = {b[i:i + 3] for i in range(len(b) - 2)}
+    if not grams_a or not grams_b:
+        return False
+    overlap = len(grams_a & grams_b) / len(grams_a | grams_b)
+    return overlap >= 0.8
+
+
 def clean_title(title: str) -> str:
     title = re.sub(r"\s*[_|]\s*(?:手机)?新浪网.*$", "", title)
+    # 快讯常见「【标题】正文……」格式:只保留方括号内的标题
+    bracket = re.match(r"^【([^】]{8,80})】", title)
+    if bracket:
+        title = bracket.group(1).strip()
     title = re.sub(r"^(?:解读|分析|观察|深度|焦点)[｜|:：\-]\s*", "", title)
     for sep in ("|", "丨", "｜", "_"):
         if sep in title:
@@ -580,6 +652,9 @@ def score_item(item: Dict[str, Any], now: datetime) -> float:
             value += weight
     if NUMBER_RE.search(text):
         value += 2
+    # 疑问式标题多为前瞻/评论,不是已发生的事实
+    if item["title"].rstrip().endswith(("？", "?")):
+        value -= 5
     summary = item.get("summary", "")
     if len(summary) >= 60 and not normalize(summary).startswith(normalize(item["title"])[:20]):
         value += 2
@@ -612,6 +687,7 @@ def candidates(
 ) -> Dict[str, List[Dict[str, Any]]]:
     seen_urls = set(state.get("urls", []))
     seen_titles = set(state.get("titles", []))
+    seen_norms = [normalize(t) for t in state.get("titles", []) if t]
     cutoff = now - timedelta(minutes=max_age)
     buckets: Dict[str, List[Dict[str, Any]]] = {tag: [] for tag, _ in CATEGORIES}
 
@@ -624,12 +700,15 @@ def candidates(
             continue
         if item["link"] in seen_urls or normalize(title) in seen_titles:
             continue
+        norm_title = normalize(title)
+        if any(same_event(norm_title, prev) for prev in seen_norms):
+            continue
         tag = classify(item, item.get("hint"))
         if not tag:
             continue
         item["category"] = tag
         score = score_item(item, now)
-        if score < 2:
+        if score < MIN_SCORE:
             log(f"skip low value ({score:+.0f}) [{tag}] {title[:40]}")
             continue
         item["score"] = score
@@ -677,7 +756,10 @@ def build_blocks(items: List[Dict[str, Any]]) -> List[str]:
         summary = shorten(item.get("summary", ""), 190)
         if normalize(summary).startswith(normalize(item["title"])[:20]):
             summary = summary[len(item["title"]):].lstrip("：:，, ")
-        summary = html.escape(shorten(summary, 170))
+        summary = shorten(summary, 170)
+        if summary and summary[-1] not in "。！？!?….…":
+            summary += "…"
+        summary = html.escape(summary)
         media = html.escape(item.get("media") or "原文")
         link = html.escape(item["link"], quote=True)
         block = [f"<b>{index}. [{item['category']}] {title}</b>"]
