@@ -169,6 +169,8 @@ NEGATIVE = {
     "他说": -5, "官员称": -4, "回应称": -3, "发言人称": -2,
     # 分析师/专家观点不是事实进展
     "专家称": -6, "分析师": -4, "首席": -4, "认为": -3, "预计": -3,
+    # 前官员/机构的个人预测属于观点,不是政策或数据本身
+    "前副主席": -5, "大概率": -4, "推手": -5,
     "划等号": -4, "前景": -4, "展望": -4, "或将": -3,
     # 标题党 / 自媒体评论
     "遮羞布": -8, "底牌": -5, "撕了": -7, "慌了": -6, "崩了": -5,
@@ -827,6 +829,9 @@ def score_item(item: Dict[str, Any], now: datetime) -> float:
     # 疑问式标题多为前瞻/评论,不是已发生的事实
     if item["title"].rstrip().endswith(("？", "?")):
         value -= 5
+    elif "？" in item["title"] or "?" in item["title"]:
+        # 设问式标题(问号埋在标题中间)多为评论/预测,不是已发生的事实
+        value -= 4
     summary = item.get("summary", "")
     if len(summary) >= 60 and not normalize(summary).startswith(normalize(item["title"])[:20]):
         value += 2
