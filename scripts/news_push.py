@@ -91,6 +91,7 @@ CATEGORIES: List[Tuple[str, List[str]]] = [
             "地缘 冲突 局势",
             "制裁 外交 谈判",
             "中东 停火",
+            "油轮 霍尔木兹",
             "选举 政局",
             "俄乌 冲突",
             "联合国 制裁 决议",
@@ -220,6 +221,10 @@ LOW_TRUST_HOSTS = (
     "or100.cc",
     # 零售交易资讯站,正文多为行情点评与免责声明
     "fx678.com",
+    # 境外中文评论站,以立场性评论/连线节目为主,缺一手事实
+    "ntdtv.com", "epochtimes.com", "secretchina.com", "aboluowang.com",
+    # 汽车门户的用户投稿号,多为厂商通稿
+    "aikahao.xcar.com.cn", "xcar.com.cn",
 )
 
 
@@ -245,7 +250,7 @@ TRUSTED_MEDIA = (
 )
 LOW_TRUST_MEDIA = (
     "搜狐", "网易", "百家号", "头条", "微信公众号", "知乎", "微博", "大鱼号",
-    "企鹅号", "一点资讯",
+    "企鹅号", "一点资讯", "新唐人", "大纪元", "阿波罗网",
 )
 
 NUMBER_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:%|亿|万|美元|元|吨|标箱|点)")
@@ -551,6 +556,12 @@ def enrich(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     summary = body
 
     summary = clean_summary(summary, item["title"])
+    if len(summary) < 20:
+        # 快讯站(华尔街见闻 livenews 等)是 JS 外壳,meta/正文都抓不到。
+        # 若 feed 原文本身已是完整的事实陈述,直接采用,避免丢掉重要突发。
+        raw = OUTLET_TAIL.sub("", re.sub(r"\s+", " ", item.get("summary") or "").strip())
+        if len(raw) >= 20 and re.search(r"[。！？!?]", raw):
+            summary = raw
     item["summary"] = summary
     if len(summary) < 20:
         return None
@@ -928,6 +939,8 @@ def score_item(item: Dict[str, Any], now: datetime) -> float:
 HARD_SKIP = (
     "彩票", "球赛", "寒潮", "天气", "明星", "娱乐", "美食", "旅游",
     "早间要闻", "早知道", "点1氪", "早报", "午报", "晚报", "日报", "周报",
+    # 券商评级/目标价是交易提示,不是新闻事件
+    "评级上调", "评级下调", "目标价",
 )
 
 # 快讯站的「今日要闻」「盘前必读」是多条消息的拼盘,不是单一事件,不能推送。
@@ -935,6 +948,8 @@ ROUNDUP = re.compile(
     r"(?:今日|昨日|隔夜|盘前|盘中|早间|午间|晚间|周末|本周).{0,12}"
     r"(?:要闻|速递|汇总|盘点|必读|大事|前瞻)"
     r"|(?:要闻|速递|汇总|盘点|必读)\s*[】\]]"
+    # 投资站的「市场动向解析」是盘前预告,不是已发生的事实
+    r"|市场动向"
     r"|^\s*\d+\s*[、．]\s*"
     r"|\d+\s*[、．].{4,60}\d+\s*[、．]",
     re.I,
