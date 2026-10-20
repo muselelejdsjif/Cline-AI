@@ -1,0 +1,55 @@
+name: news-push
+
+on:
+  schedule:
+    # 每 10 分钟一次(UTC);GitHub 高峰期可能延迟几分钟
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: news-push
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore dedupe state
+        run: |
+          git fetch --depth=1 origin bot-state || true
+          if git show origin/bot-state:.news_seen.json > .news_seen.json 2>/dev/null; then
+            echo "state restored ($(wc -c < .news_seen.json) bytes)"
+          else
+            printf '{"urls": [], "titles": [], "empty_runs": 0}\n' > .news_seen.json
+            echo "fresh state"
+          fi
+
+      - name: Push news to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "::error::Repository secret TELEGRAM_BOT_TOKEN is missing (Settings -> Secrets and variables -> Actions)."
+            exit 1
+          fi
+          python3 scripts/news_push.py \
+            --chat-id "${{ vars.TELEGRAM_CHAT_ID || '8611407819' }}" \
+            --max-age 240 \
+            --max-items 4
+
+      - name: Persist dedupe state
+        if: always()
+        run: |
+          git config user.name "cline-news-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git checkout -B bot-state
+          git add -f .news_seen.json
+          git commit -m "state: $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "no state change"
+          git push -f origin bot-state
