@@ -840,6 +840,44 @@ def classify(item: Dict[str, Any], hint: Optional[str]) -> Optional[str]:
 STATEMENT = re.compile(r"(表示|认为|呼吁|建议|指出|称，)")
 ACTION = re.compile(r"(宣布|签署|批准|发布|启动|加征|下调|上调|实施|通过|达成|生效|暂停|禁止|辞职|当选)")
 
+# 「财联社7月9日讯」这类电头是可靠的发稿日期;部分聚合源不给 published,
+# 不校验就会把几个月前的旧稿当成新热点。
+DATELINE = re.compile(
+    r"(?:(20\d{2})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(?:讯|电(?![话视])|消息)"
+)
+
+
+def stale_dateline(
+    item: Dict[str, Any], cutoff: datetime, now: datetime
+) -> Optional[datetime]:
+    """正文电头早于 cutoff 时返回该日期,用于丢弃旧稿。"""
+    text = f"{item.get('title', '')} {item.get('summary', '')}"[:600]
+    for match in DATELINE.finditer(text):
+        year = int(match.group(1)) if match.group(1) else now.year
+        month, day = int(match.group(2)), int(match.group(3))
+        try:
+            stamp = datetime(year, month, day, tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        # 无年份时按最近一次出现推断(跨年稿件)
+        if not match.group(1) and stamp - now > timedelta(days=1):
+            try:
+                stamp = stamp.replace(year=year - 1)
+            except ValueError:
+                continue
+        if stamp < cutoff - timedelta(days=1):
+            return stamp
+    return None
+
+
+# 现场特稿/走访稿讲的是场景,不是刚发生的事实。
+FEATURE = re.compile(r"(背后[:：]|见闻|探访|走访|蹲点|记者手记)")
+
+# 「欧洲央行管委Rehn：法德利差有所扩大」这类官员表态是评论,不是事件。
+OFFICIAL_QUOTE = re.compile(
+    r"(管委|行长|主席|理事|发言人|官员|总裁|分析师|策略师|经济学家)[^：:]{0,8}[：:]"
+)
+
 
 def score_item(item: Dict[str, Any], now: datetime) -> float:
     text = f"{item['title']} {item.get('summary', '')[:200]}"
@@ -861,6 +899,14 @@ def score_item(item: Dict[str, Any], now: datetime) -> float:
     elif "？" in item["title"] or "?" in item["title"]:
         # 设问式标题(问号埋在标题中间)多为评论/预测,不是已发生的事实
         value -= 4
+    if FEATURE.search(item["title"]):
+        value -= 4
+    if (
+        OFFICIAL_QUOTE.search(item["title"])
+        and not NUMBER_RE.search(item["title"])
+        and not ACTION.search(item["title"])
+    ):
+        value -= 5
     summary = item.get("summary", "")
     if len(summary) >= 60 and not normalize(summary).startswith(normalize(item["title"])[:20]):
         value += 2
@@ -967,6 +1013,10 @@ def candidates(
             continue
         if item.get("published") and item["published"] < cutoff:
             continue
+        old = stale_dateline(item, cutoff, now)
+        if old:
+            log(f"skip stale dateline ({old:%Y-%m-%d}) [{title[:30]}]")
+            continue
         if item["link"] in seen_urls or normalize(title) in seen_titles:
             continue
         norm_title = normalize(title)
@@ -996,6 +1046,7 @@ def pick(
     max_items: int,
     enrich_budget: int = 14,
     state: Optional[Dict[str, Any]] = None,
+    max_age: int = 240,
 ) -> List[Dict[str, Any]]:
     """Enrich the best candidate per category, one category at most once."""
     picked: List[Dict[str, Any]] = []
@@ -1018,6 +1069,14 @@ def pick(
             if not enriched:
                 continue
             enriched["title"] = enriched["title"].replace("\n", " ").strip()
+            old = stale_dateline(
+                enriched,
+                datetime.now(timezone.utc) - timedelta(minutes=max_age),
+                datetime.now(timezone.utc),
+            )
+            if old:
+                log(f"skip stale dateline after enrich ({old:%Y-%m-%d}) [{enriched['title'][:30]}]")
+                continue
             norm = normalize(enriched["title"])
             keys = fingerprints(enriched)
             if keys & seen_events:
@@ -1044,7 +1103,7 @@ def build_blocks(items: List[Dict[str, Any]]) -> List[str]:
         title = html.escape(shorten(item["title"], 90))
         summary = shorten(item.get("summary", ""), 190)
         if normalize(summary).startswith(normalize(item["title"])[:20]):
-            summary = summary[len(item["title"]):].lstrip("：:，, ")
+            summary = summary[len(item["title"]):].lstrip("：:，,。；;、 ")
         summary = shorten(summary, 170)
         if summary and summary[-1] not in "。！？!?….…":
             summary += "…"
@@ -1219,7 +1278,7 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     buckets = candidates(items, state, now, args.max_age)
-    picked = pick(buckets, args.max_items, state=state)
+    picked = pick(buckets, args.max_items, state=state, max_age=args.max_age)
     coverage = {item["category"] for item in picked}
 
     if len(picked) < 2 or len(coverage) < 2:
