@@ -197,6 +197,8 @@ NEGATIVE = {
     "论坛": -4, "开幕式": -4, "发布会": -2, "圆桌": -6, "年会": -5, "致辞": -6,
     # 数据前瞻/预告稿:写的是将要发生的事,不是已落地的结果
     "揭晓": -4, "市场参考": -5, "本周晚些": -4, "或打乱": -3,
+    # 明确「符合预期/按兵不动」的结果没有超预期冲击,不算热点
+    "符合预期": -4, "符合市场预期": -4, "按兵不动": -2, "皆有可能": -2,
 }
 
 # 信源质量:主流通讯社/官方/专业媒体加分,内容农场与自媒体降权。
@@ -212,6 +214,12 @@ LOW_TRUST_HOSTS = (
     "sohu.com", "baijiahao.baidu.com", "toutiao.com", "zhihu.com", "weibo.com",
     "k.sina.com.cn", "dy.163.com", "mp.weixin.qq.com", "hao.360.com",
     "chineseherald.co.nz", "chinesenzherald.co.nz",
+    # 机器翻译/转载聚合站,常混入「WhatsApp频道」一类抓取残留
+    "idnfinancials.com", "stockstar.com",
+    # 无编辑品牌的自建站/博客,以解读、观点类长文为主
+    "or100.cc",
+    # 零售交易资讯站,正文多为行情点评与免责声明
+    "fx678.com",
 )
 
 
@@ -562,13 +570,26 @@ NAV_PREFIX = re.compile(
     r"(?:(?:评论|收藏|分享|打印|字号|点赞|举报|返回|更多)\s*[：:]?\s*){2,}[：:]?\s*"
 )
 # 导航栏/版权声明一类的抓取残留,不能当摘要用。
-BOILERPLATE = ("广告服务", "联系我们", "隐私政策", "使用条款", "版权所有", "扫码关注")
+BOILERPLATE = (
+    "广告服务", "联系我们", "隐私政策", "使用条款", "版权所有", "扫码关注",
+    "只作为参考", "投资决定", "不构成投资建议", "任何在本网站",
+)
+# 机翻站点会在正文前挂频道推广,术语表用「[[」引出,均不属于新闻内容。
+JUNK_PREFIX = re.compile(
+    r"^(?:(?:WhatsApp|Telegram|Twitter|LINE|微信|推特)\s*(?:频道|群|公众号)?\s*"
+    r"[|｜:：\-—]?\s*)+",
+    re.I,
+)
+GLOSSARY = re.compile(r"\s*\[\[.*$", re.S)
 
 
 def is_boilerplate(summary: str) -> bool:
     if sum(summary.count(word) for word in BOILERPLATE) >= 2:
         return True
     if "首页" in summary and "搜索" in summary:
+        return True
+    # 相关性推荐把几条无关标题拼在一起,常出现多个问号
+    if summary.count("？") >= 2:
         return True
     return summary.count("×") >= 2
 
@@ -595,6 +616,8 @@ def clean_summary(summary: str, title: str) -> str:
     """Drop outlet suffixes and lead markers; blank out title-echo summaries."""
     summary = LEAD_MARKER.sub("", re.sub(r"\s+", " ", summary or "").strip())
     summary = NAV_PREFIX.sub("", summary)
+    summary = JUNK_PREFIX.sub("", summary)
+    summary = GLOSSARY.sub("", summary)
     if is_boilerplate(summary):
         return ""
     # 去掉快讯的「【标题】」外壳,避免按标题长度切前缀时残留一个「】」
@@ -667,6 +690,12 @@ COUNTRIES = ("中国", "美国", "欧元区", "日本", "德国", "英国", "韩
 EVENT_ENTITIES = (
     "openai", "anthropic", "英伟达", "台积电", "特斯拉", "苹果", "华为",
     "三星", "亚马逊", "微软", "meta", "谷歌", "deepmind", "字节跳动",
+)
+# 同一政策议题会被各家反复改写标题(如「出口管制/反倾销」),用高区分度术语的两两组合做话题指纹。
+TOPIC_TERMS = (
+    "政策利率", "隔夜逆回购", "利率走廊", "lpr", "存款准备金率", "降准",
+    "出口管制", "反倾销", "制裁清单", "停火协议", "和平协议", "运价指数",
+    "央行",
 )
 
 
@@ -888,6 +917,32 @@ def event_keys(item: Dict[str, Any]) -> set:
     return {f"{name}:{num}" for name in entities for num in numbers}
 
 
+def topic_keys(item: Dict[str, Any]) -> set:
+    """同一政策议题的改写稿:命中的高区分度术语两两成对作为指纹。"""
+    text = f"{item.get('title', '')} {item.get('summary', '')[:300]}".lower()
+    hits = sorted({term for term in TOPIC_TERMS if term in text})
+    if len(hits) < 2:
+        return set()
+    return {
+        f"topic:{left}+{right}"
+        for index, left in enumerate(hits)
+        for right in hits[index + 1:]
+    }
+
+
+def fingerprints(item: Dict[str, Any]) -> set:
+    return event_keys(item) | topic_keys(item)
+
+
+def seen_fingerprints(state: Optional[Dict[str, Any]]) -> set:
+    """历史指纹:已记录的事件 + 从历史标题反推的话题指纹(兼容旧状态文件)。"""
+    state = state or {}
+    keys = set(state.get("events", []))
+    for title in state.get("titles", []):
+        keys |= topic_keys({"title": title})
+    return keys
+
+
 def candidates(
     items: List[Dict[str, Any]],
     state: Dict[str, Any],
@@ -897,7 +952,7 @@ def candidates(
     seen_urls = {canonical_url(u) for u in state.get("urls", [])}
     seen_titles = set(state.get("titles", []))
     seen_norms = [normalize(t) for t in state.get("titles", []) if t]
-    seen_events = set(state.get("events", []))
+    seen_events = seen_fingerprints(state)
     cutoff = now - timedelta(minutes=max_age)
     buckets: Dict[str, List[Dict[str, Any]]] = {tag: [] for tag, _ in CATEGORIES}
 
@@ -917,7 +972,7 @@ def candidates(
         norm_title = normalize(title)
         if any(same_event(norm_title, prev) for prev in seen_norms):
             continue
-        if seen_events and event_keys(item) & seen_events:
+        if seen_events and fingerprints(item) & seen_events:
             log(f"skip seen event [{title[:30]}]")
             continue
         tag = classify(item, item.get("hint"))
@@ -940,12 +995,16 @@ def pick(
     buckets: Dict[str, List[Dict[str, Any]]],
     max_items: int,
     enrich_budget: int = 14,
+    state: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Enrich the best candidate per category, one category at most once."""
     picked: List[Dict[str, Any]] = []
     used_titles = set()
     used_links = set()
     budget = enrich_budget
+    # 事件指纹在富化后才完整(金额/数量常来自正文),所以这里再核对一次历史记录。
+    seen_events = seen_fingerprints(state)
+    seen_norms = [normalize(t) for t in (state or {}).get("titles", []) if t]
 
     for tag, _ in CATEGORIES:
         if len(picked) >= max_items or budget <= 0:
@@ -959,8 +1018,21 @@ def pick(
             if not enriched:
                 continue
             enriched["title"] = enriched["title"].replace("\n", " ").strip()
+            norm = normalize(enriched["title"])
+            keys = fingerprints(enriched)
+            if keys & seen_events:
+                log(f"skip seen event after enrich [{enriched['title'][:30]}]")
+                continue
+            if any(same_event(norm, prev) for prev in seen_norms):
+                log(f"skip seen topic after enrich [{enriched['title'][:30]}]")
+                continue
+            # Google News 条目在打分时还是跳转域名,解析出真实站点后要再核一次信源质量。
+            if source_weight(enriched.get("link", "")) <= -5:
+                log(f"skip low-trust source after resolve [{enriched['title'][:30]}]")
+                continue
             used_titles.add(key)
             used_links.add(enriched["link"])
+            seen_events |= keys
             picked.append(enriched)
             break
     return picked
@@ -1110,7 +1182,7 @@ def _record_push(state: Dict[str, Any], items: List[Dict[str, Any]]) -> None:
     state["urls"].extend(item["link"] for item in items)
     state["titles"].extend(normalize(item["title"]) for item in items)
     state.setdefault("events", []).extend(
-        key for item in items for key in sorted(event_keys(item))
+        key for item in items for key in sorted(fingerprints(item))
     )
     state["events"] = state["events"][-200:]
     state["empty_runs"] = 0
@@ -1147,7 +1219,7 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     buckets = candidates(items, state, now, args.max_age)
-    picked = pick(buckets, args.max_items)
+    picked = pick(buckets, args.max_items, state=state)
     coverage = {item["category"] for item in picked}
 
     if len(picked) < 2 or len(coverage) < 2:
