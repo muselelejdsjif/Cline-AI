@@ -167,6 +167,9 @@ NEGATIVE = {
     "解读": -3, "评论": -4, "专访": -6, "一文": -4, "全文": -4,
     "梳理": -5, "速览": -5, "他指出": -5, "他表示": -5, "她说": -5,
     "他说": -5, "官员称": -4, "回应称": -3, "发言人称": -2,
+    # 分析师/专家观点不是事实进展
+    "专家称": -6, "分析师": -4, "首席": -4, "认为": -3, "预计": -3,
+    "划等号": -4, "前景": -4, "展望": -4, "或将": -3,
     # 标题党 / 自媒体评论
     "遮羞布": -8, "底牌": -5, "撕了": -7, "慌了": -6, "崩了": -5,
     "炸了": -6, "竟然": -6, "真相": -5, "内幕": -6, "意味着什么": -4,
@@ -200,6 +203,7 @@ TRUSTED_HOSTS = (
 LOW_TRUST_HOSTS = (
     "sohu.com", "baijiahao.baidu.com", "toutiao.com", "zhihu.com", "weibo.com",
     "k.sina.com.cn", "dy.163.com", "mp.weixin.qq.com", "hao.360.com",
+    "chineseherald.co.nz", "chinesenzherald.co.nz",
 )
 
 
@@ -508,7 +512,7 @@ def enrich(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if "news.google.com" in link:
             log(f"cannot resolve publisher url: {item['title'][:40]}")
             return None
-    item["link"] = link
+    item["link"] = canonical_url(link)
 
     summary = re.sub(r"\s+", " ", item.get("summary") or "").strip()
     summary = clean_summary(summary, item["title"])
@@ -544,11 +548,23 @@ OUTLET_TAIL = re.compile(
     re.I,
 )
 LEAD_MARKER = re.compile(r"^(?:解读|分析|观察|深度|焦点|专访|评论)\s*[｜|:：\-]\s*")
+# 导航栏/版权声明一类的抓取残留,不能当摘要用。
+BOILERPLATE = ("广告服务", "联系我们", "隐私政策", "使用条款", "版权所有", "扫码关注")
+
+
+def is_boilerplate(summary: str) -> bool:
+    if sum(summary.count(word) for word in BOILERPLATE) >= 2:
+        return True
+    if "首页" in summary and "搜索" in summary:
+        return True
+    return summary.count("×") >= 2
 
 
 def clean_summary(summary: str, title: str) -> str:
     """Drop outlet suffixes and lead markers; blank out title-echo summaries."""
     summary = LEAD_MARKER.sub("", re.sub(r"\s+", " ", summary or "").strip())
+    if is_boilerplate(summary):
+        return ""
     # 去掉快讯的「【标题】」外壳,避免按标题长度切前缀时残留一个「】」
     summary = re.sub(r"^【([^】]{8,80})】\s*", r"\1 ", summary)
     summary = OUTLET_TAIL.sub("", summary).strip(" ，,、；;|-_")
@@ -569,10 +585,78 @@ def normalize(title: str) -> str:
     return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", title).lower()
 
 
+# 跟踪参数会让同一篇文章出现多个 URL,破坏按 URL 去重。
+TRACKING_PARAMS = {
+    "oid", "vt", "cid", "node_id", "spm", "from", "source", "share_token",
+    "at_medium", "at_campaign", "fbclid", "gclid", "ref", "cmpid", "oc",
+    "wfr", "sr_share", "share_source", "s_channel", "spm_id_from",
+}
+
+
+def canonical_url(link: str) -> str:
+    """去掉跟踪参数与锚点,让同一篇文章只对应一个 URL。"""
+    if not link:
+        return link
+    parts = urllib.parse.urlsplit(link)
+    query = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=False)
+        if key.lower() not in TRACKING_PARAMS and not key.lower().startswith("utm_")
+    ]
+    path = parts.path
+    if path.endswith("/") and path != "/":
+        path = path.rstrip("/")
+    return urllib.parse.urlunsplit(
+        (
+            parts.scheme or "https",
+            parts.netloc.lower(),
+            path,
+            urllib.parse.urlencode(query),
+            "",
+        )
+    )
+
+
+def _numbers(text: str) -> set:
+    """标题里的关键数字(含小数),忽略年份和个位月份一类弱特征。"""
+    found = re.findall(r"\d+(?:\.\d+)?", text)
+    return {n for n in found if len(n.replace(".", "")) >= 2 and n not in {"2024", "2025", "2026", "2027"}}
+
+
+# 同一份统计数据的稿子常被改写标题,用「指标 + 数值 + 经济体」三元组识别。
+DATA_SUBJECTS = (
+    "gdp", "cpi", "ppi", "pmi", "失业率", "非农", "社融", "m2", "lpr",
+    "工业增加值", "社会消费品零售",
+)
+COUNTRIES = ("中国", "美国", "欧元区", "日本", "德国", "英国", "韩国", "印度", "越南", "巴西")
+
+
+def _months(text: str) -> set:
+    return {m for m in re.findall(r"(\d{1,2})月", text)}
+
+
+def same_data_release(a: str, b: str) -> bool:
+    subjects = {s for s in DATA_SUBJECTS if s in a and s in b}
+    if not subjects:
+        return False
+    if not _numbers(a) & _numbers(b):
+        return False
+    countries_a = {c for c in COUNTRIES if c in a}
+    countries_b = {c for c in COUNTRIES if c in b}
+    if countries_a and countries_b and not countries_a & countries_b:
+        return False
+    months_a, months_b = _months(a), _months(b)
+    if months_a and months_b and not months_a & months_b:
+        return False
+    return True
+
+
 def same_event(a: str, b: str) -> bool:
     """同一事件的不同转载:标题高度重合(仅站点后缀/个别措辞不同)。"""
     if not a or not b:
         return False
+    if same_data_release(a, b):
+        return True
     if len(a) >= 16 and len(b) >= 16 and (a[:20] in b or b[:20] in a):
         return True
     short, long_ = (a, b) if len(a) <= len(b) else (b, a)
@@ -583,7 +667,24 @@ def same_event(a: str, b: str) -> bool:
     if not grams_a or not grams_b:
         return False
     overlap = len(grams_a & grams_b) / len(grams_a | grams_b)
-    return overlap >= 0.8
+    if overlap >= 0.8:
+        return True
+    # 同一条数据稿常被不同媒体改写结尾:前缀一致且关键数字相同即视为同一事件。
+    prefix = 0
+    for left, right in zip(a, b):
+        if left != right:
+            break
+        prefix += 1
+    if prefix >= 8 and _numbers(a) & _numbers(b):
+        return True
+    # 长短两版转载(一方补了背景/引述)用二元组包含率兜底。
+    if min(len(a), len(b)) >= 14:
+        bigrams_a = {a[i:i + 2] for i in range(len(a) - 1)}
+        bigrams_b = {b[i:i + 2] for i in range(len(b) - 1)}
+        containment = len(bigrams_a & bigrams_b) / min(len(bigrams_a), len(bigrams_b))
+        if containment >= 0.6:
+            return True
+    return False
 
 
 def clean_title(title: str) -> str:
@@ -678,6 +779,20 @@ HARD_SKIP = (
     "早间要闻", "早知道", "点1氪", "早报", "午报", "晚报", "日报", "周报",
 )
 
+# 快讯站的「今日要闻」「盘前必读」是多条消息的拼盘,不是单一事件,不能推送。
+ROUNDUP = re.compile(
+    r"(?:今日|昨日|隔夜|盘前|盘中|早间|午间|晚间|周末|本周).{0,12}"
+    r"(?:要闻|速递|汇总|盘点|必读|大事|前瞻)"
+    r"|(?:要闻|速递|汇总|盘点|必读)\s*[】\]]"
+    r"|^\s*\d+\s*[、．]\s*"
+    r"|\d+\s*[、．].{4,60}\d+\s*[、．]",
+    re.I,
+)
+
+
+def is_roundup(title: str) -> bool:
+    return bool(ROUNDUP.search(title))
+
 
 def candidates(
     items: List[Dict[str, Any]],
@@ -685,7 +800,7 @@ def candidates(
     now: datetime,
     max_age: int,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    seen_urls = set(state.get("urls", []))
+    seen_urls = {canonical_url(u) for u in state.get("urls", [])}
     seen_titles = set(state.get("titles", []))
     seen_norms = [normalize(t) for t in state.get("titles", []) if t]
     cutoff = now - timedelta(minutes=max_age)
@@ -693,8 +808,12 @@ def candidates(
 
     for item in items:
         item["title"] = clean_title(item["title"])
+        item["link"] = canonical_url(item["link"])
         title = item["title"]
         if len(title) < 8 or any(word in title for word in HARD_SKIP):
+            continue
+        if is_roundup(title):
+            log(f"skip roundup [{title[:30]}]")
             continue
         if item.get("published") and item["published"] < cutoff:
             continue
